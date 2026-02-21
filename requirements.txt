@@ -6,4 +6,3 @@ flask
 GitPython
 langchain_groq
 python-dotenv 
--e .
