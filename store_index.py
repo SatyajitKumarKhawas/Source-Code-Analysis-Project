@@ -1,21 +1,265 @@
-from src.helper import repo_ingestion, load_repo, text_splitter, load_embedding 
-from dotenv import load_dotenv
-from langchain.vectorstores import Chroma
 import os
-
+import stat
+import time
+import shutil
+import subprocess
+import streamlit as st
+from langchain.vectorstores import Chroma
+from langchain_groq import ChatGroq
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.chains import create_history_aware_retriever, create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage
+from dotenv import load_dotenv
+from src.helper import repo_ingestion
 
 load_dotenv()
 
-OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
-os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+
+st.set_page_config(page_title="GitHub Repo Chatbot", page_icon="💬", layout="wide")
+st.title("💬 GitHub Repo Chatbot")
 
 
+# ------------------------------------------------------------------ #
+#  Utility Helpers                                                     #
+# ------------------------------------------------------------------ #
 
-documents = load_repo("repo/")
-text_chunks = text_splitter(documents)
-embeddings = load_embedding()
+def force_remove_readonly(func, path, excinfo):
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
 
 
-#storing vector in choramdb
-vectordb = Chroma.from_documents(text_chunks, embedding=embeddings, persist_directory='./db')
-vectordb.persist()
+def safe_remove_dir(path):
+    """Remove directory safely on Windows."""
+    if not os.path.exists(path):
+        return True
+
+    # Try multiple times with increasing delays
+    for attempt in range(5):
+        try:
+            shutil.rmtree(path, onexc=force_remove_readonly)
+            return True
+        except Exception:
+            time.sleep(1 + attempt)
+
+    # Last resort: file by file
+    deleted_all = True
+    for root, dirs, files in os.walk(path, topdown=False):
+        for file in files:
+            file_path = os.path.join(root, file)
+            try:
+                os.chmod(file_path, stat.S_IWRITE)
+                os.remove(file_path)
+            except Exception:
+                deleted_all = False
+        for d in dirs:
+            try:
+                os.rmdir(os.path.join(root, d))
+            except Exception:
+                deleted_all = False
+    try:
+        os.rmdir(path)
+    except Exception:
+        deleted_all = False
+
+    return deleted_all
+
+
+def run_store_index():
+    """
+    Run store_index.py in a completely separate subprocess.
+    This ensures ChromaDB runs in its own process and
+    doesn't conflict with the Streamlit process.
+    """
+    result = subprocess.run(
+        [sys.executable, "store_index.py", "--clean"],
+        capture_output=True,
+        text=True,
+        timeout=300  # 5 min timeout
+    )
+    return result
+
+
+# ------------------------------------------------------------------ #
+#  Sidebar                                                             #
+# ------------------------------------------------------------------ #
+
+import sys
+
+with st.sidebar:
+    st.header("📂 Load a GitHub Repo")
+    repo_url = st.text_input("Enter GitHub Repo URL")
+
+    if st.button("⚡ Ingest Repo"):
+        if repo_url.strip() == "":
+            st.warning("Please enter a valid GitHub repo URL.")
+        else:
+            with st.spinner("Step 1/3: Releasing old connections..."):
+                # Release cached chain so ChromaDB connection is dropped
+                st.cache_resource.clear()
+                time.sleep(3)
+
+            with st.spinner("Step 2/3: Cloning repository..."):
+                try:
+                    # Only delete repo folder (not db - let store_index.py handle db)
+                    safe_remove_dir("repo")
+                    repo_ingestion(repo_url)
+                except Exception as e:
+                    st.error(f"⚠️ Clone failed: {e}")
+                    st.stop()
+
+            with st.spinner("Step 3/3: Building vector database..."):
+                try:
+                    # Run store_index in subprocess — it handles db deletion internally
+                    result = run_store_index()
+                    if result.returncode != 0:
+                        st.error(f"⚠️ store_index.py failed:\n{result.stderr}")
+                        st.stop()
+                except subprocess.TimeoutExpired:
+                    st.error("⚠️ Timed out building vector DB.")
+                    st.stop()
+                except Exception as e:
+                    st.error(f"⚠️ Error: {e}")
+                    st.stop()
+
+            st.success("✅ Repo ingested! Ask your question below.")
+            st.rerun()
+
+    st.markdown("---")
+
+    if st.button("🗑️ Clear Repo & DB"):
+        with st.spinner("Clearing connections..."):
+            st.cache_resource.clear()
+            time.sleep(3)
+
+        with st.spinner("Deleting files..."):
+            safe_remove_dir("repo")
+            safe_remove_dir("db")
+
+        st.session_state.messages = []
+        st.session_state.chat_history = []
+        st.success("✅ Cleared!")
+        st.rerun()
+
+    if st.button("🧹 Clear Chat History"):
+        st.session_state.messages = []
+        st.session_state.chat_history = []
+        st.rerun()
+
+    st.markdown("---")
+    st.markdown("### ℹ️ Model Info")
+    st.markdown("**LLM:** Groq `qwen-qwq-32b`")
+    st.markdown("**Embeddings:** `all-MiniLM-L6-v2` (local)")
+    st.info("💡 If issues persist, stop the app, delete `db/` manually, and restart.")
+
+
+# ------------------------------------------------------------------ #
+#  Load RAG Chain (cached)                                             #
+# ------------------------------------------------------------------ #
+
+@st.cache_resource
+def load_chain():
+    if not os.path.exists("db"):
+        return None
+
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True}
+    )
+
+    vectordb = Chroma(
+        persist_directory="db",
+        embedding_function=embeddings
+    )
+
+    llm = ChatGroq(
+        groq_api_key=GROQ_API_KEY,
+        model_name="qwen-qwq-32b",
+        temperature=0.5,
+    )
+
+    retriever = vectordb.as_retriever(
+        search_type="mmr",
+        search_kwargs={"k": 3}
+    )
+
+    contextualize_q_prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "Given the chat history and the latest user question, "
+         "reformulate the question to be standalone and clear. "
+         "Do NOT answer it, just reformulate if needed."),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}")
+    ])
+
+    history_aware_retriever = create_history_aware_retriever(
+        llm, retriever, contextualize_q_prompt
+    )
+
+    qa_prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "You are an expert code assistant. Use the retrieved code context "
+         "below to answer the user's question clearly and concisely.\n\n"
+         "Context:\n{context}"),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}")
+    ])
+
+    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
+    rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
+
+    return rag_chain
+
+
+# ------------------------------------------------------------------ #
+#  Main Chat Interface                                                 #
+# ------------------------------------------------------------------ #
+
+if not os.path.exists("db"):
+    st.info("👈 Please ingest a GitHub repo from the sidebar to get started.")
+    st.stop()
+
+try:
+    rag_chain = load_chain()
+    if rag_chain is None:
+        st.info("👈 Please ingest a GitHub repo from the sidebar to get started.")
+        st.stop()
+except Exception as e:
+    st.error(f"⚠️ Error loading chain: {e}")
+    st.stop()
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+if prompt := st.chat_input("Ask something about the repo..."):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        with st.spinner("🤔 Thinking..."):
+            try:
+                result = rag_chain.invoke({
+                    "input": prompt,
+                    "chat_history": st.session_state.chat_history
+                })
+                answer = result["answer"]
+            except Exception as e:
+                answer = f"⚠️ Error: {e}"
+        st.markdown(answer)
+
+    st.session_state.messages.append({"role": "assistant", "content": answer})
+    st.session_state.chat_history.extend([
+        HumanMessage(content=prompt),
+        AIMessage(content=answer)
+    ])
